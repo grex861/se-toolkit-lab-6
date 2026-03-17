@@ -18,13 +18,13 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read contents of a file from the project wiki directory. Use to find answers in documentation.",
+            "description": "Read contents of a file from the project wiki or source code. Use for documentation questions or static system facts (framework, ports, status codes).",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative path to file from project root, e.g. 'wiki/git-workflow.md'"
+                        "description": "Relative path to file from project root, e.g. 'wiki/git-workflow.md' or 'backend/app/main.py'"
                     }
                 },
                 "required": ["path"]
@@ -35,16 +35,45 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "list_files",
-            "description": "List files and directories in wiki directory. Use first to discover relevant files.",
+            "description": "List files and directories. Use to discover relevant files in wiki/, backend/, or root.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative path to directory, e.g. 'wiki'"
+                        "description": "Relative path to directory, e.g. 'wiki', 'backend/app', or '.'"
                     }
                 },
                 "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_api",
+            "description": "Query the backend API for data-dependent questions. Use for item counts, scores, analytics, or any live data. NOT for static facts like framework or port numbers.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "method": {
+                        "type": "string",
+                        "description": "HTTP method: GET, POST, PUT, DELETE"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "API endpoint path, e.g. '/items/', '/analytics/scores', '/analytics/completion-rate'"
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Optional JSON request body for POST/PUT requests"
+                    },
+                    "use_auth": {
+                        "type": "boolean",
+                        "description": "Whether to include authentication header. Default: true. Set to false to test unauthenticated access."
+                    }
+                },
+                "required": ["method", "path"]
             }
         }
     }
@@ -71,16 +100,16 @@ def read_file(path: str) -> str:
 def list_files(path: str) -> str:
     """List files and directories at a given relative path."""
     full_path = (PROJECT_ROOT / path).resolve()
-    
+
     if not str(full_path).startswith(str(PROJECT_ROOT)):
         return f"Error: Access denied - path escapes project directory: {path}"
-    
+
     if not full_path.exists():
         return f"Error: Directory not found: {path}"
-    
+
     if not full_path.is_dir():
         return f"Error: Path is not a directory: {path}"
-    
+
     try:
         entries = []
         for entry in sorted(full_path.iterdir()):
@@ -90,15 +119,94 @@ def list_files(path: str) -> str:
     except Exception as e:
         return f"Error listing directory: {e}"
 
+def query_api(method: str, path: str, body: str = None, use_auth: bool = True) -> str:
+    """Query the backend API with optional authentication.
+    
+    Uses LMS_API_KEY from environment for authentication (if use_auth is True).
+    Returns JSON string with status_code and body.
+    """
+    # Read configuration from environment variables
+    api_base_url = os.getenv("AGENT_API_BASE_URL", "http://localhost:42002")
+    lms_api_key = os.getenv("LMS_API_KEY")
+    
+    # Construct full URL
+    base = api_base_url.rstrip('/')
+    url = f"{base}{path}"
+    
+    # Prepare headers
+    headers = {
+        "Content-Type": "application/json"
+    }
+    
+    # Add authentication if requested
+    if use_auth:
+        if not lms_api_key:
+            return json.dumps({
+                "status_code": 401,
+                "body": {"error": "LMS_API_KEY not set in environment"}
+            })
+        headers["Authorization"] = f"Bearer {lms_api_key}"
+    
+    try:
+        # Make the request
+        if method.upper() == "GET":
+            response = requests.get(url, headers=headers, timeout=30)
+        elif method.upper() == "POST":
+            data = json.loads(body) if body else {}
+            response = requests.post(url, json=data, headers=headers, timeout=30)
+        elif method.upper() == "PUT":
+            data = json.loads(body) if body else {}
+            response = requests.put(url, json=data, headers=headers, timeout=30)
+        elif method.upper() == "DELETE":
+            response = requests.delete(url, headers=headers, timeout=30)
+        else:
+            return json.dumps({
+                "status_code": 400,
+                "body": {"error": f"Unsupported method: {method}"}
+            })
+        
+        # Parse response body
+        try:
+            response_body = response.json()
+        except (json.JSONDecodeError, ValueError):
+            response_body = response.text
+        
+        return json.dumps({
+            "status_code": response.status_code,
+            "body": response_body
+        })
+        
+    except requests.exceptions.Timeout:
+        return json.dumps({
+            "status_code": 408,
+            "body": {"error": "Request timed out"}
+        })
+    except requests.exceptions.ConnectionError as e:
+        return json.dumps({
+            "status_code": 0,
+            "body": {"error": f"Connection error: {str(e)}"}
+        })
+    except Exception as e:
+        return json.dumps({
+            "status_code": 0,
+            "body": {"error": f"Request failed: {str(e)}"}
+        })
+
 def execute_tool(tool_call):
     """Execute a single tool call and return result."""
     func_name = tool_call["function"]["name"]
     func_args = json.loads(tool_call["function"]["arguments"])
-    
+
     if func_name == "read_file":
         return read_file(func_args["path"])
     elif func_name == "list_files":
         return list_files(func_args["path"])
+    elif func_name == "query_api":
+        method = func_args.get("method", "GET")
+        path = func_args.get("path", "")
+        body = func_args.get("body")
+        use_auth = func_args.get("use_auth", True)  # Default to True for backward compatibility
+        return query_api(method, path, body, use_auth)
     else:
         return f"Error: Unknown tool {func_name}"
 
@@ -144,15 +252,73 @@ def main():
         "Content-Type": "application/json"
     }
     
-    system_prompt = """You are a Documentation Agent. Answer ONLY based on files in wiki/.
+    system_prompt = """You are a System Agent. Answer questions using the available tools.
 
-RULES:
-1. First call list_files(path="wiki") to see available files
-2. Then read_file(path="wiki/filename.md") to read relevant file  
-3. Find section ## with the answer
-4. Final answer MUST be valid JSON only: {"answer": "text", "source": "wiki/file.md#section"}
+CRITICAL RULES:
+- ALWAYS use tools first - NEVER answer without calling tools
+- NEVER return intermediate thoughts like "Let me read" or "I need to" - only return FINAL answers
+- If a file is not found, use list_files() to discover the correct location
+- For wiki/source questions, you MUST read the file content
+- Keep calling tools until you have the complete answer, then return JSON
+- The "answer" field MUST be a TEXT STRING, not a list or object
 
-DO NOT include explanatory text. Output ONLY the JSON object."""
+AVAILABLE TOOLS:
+- read_file(path): Read wiki documentation or source code files
+- list_files(path): List files in a directory
+- query_api(method, path, body?): Query the backend API for live data
+
+TOOL SELECTION RULES:
+1. Wiki/documentation questions:
+   - Step 1: Call list_files("wiki") to find relevant files
+   - Step 2: Call read_file("wiki/filename.md") to read the content
+   - Step 3: Find the answer in the file content
+   - Step 4: Return FINAL answer as TEXT with source
+   Example: "What is the Git workflow?" → list_files("wiki"), then read_file("wiki/git-workflow.md")
+
+2. Source code questions (framework, routers, ports, status codes):
+   - Step 1: Call list_files("backend/app") to find relevant files
+   - Step 2: Call read_file("backend/app/filename.py") to read the code
+   - Step 3: Return FINAL answer as TEXT describing what you found
+   Example: "What framework is used?" → list_files("backend/app"), then read_file("backend/app/main.py")
+   Example: "List API routers" → list_files("backend/app/routers"), then read each router file, return text description
+
+3. Docker/config file questions:
+   - Step 1: Call list_files(".") to see root directory files
+   - Step 2: Read Dockerfile, docker-compose.yml, caddy/Caddyfile from correct paths
+   - Step 3: Return FINAL answer describing the architecture
+   Example: "Request journey" → list_files("."), read_file("Dockerfile"), read_file("docker-compose.yml"), read_file("caddy/Caddyfile")
+
+4. Data-dependent questions (counts, scores, analytics):
+   - Call query_api to get live data (use_auth=true by default)
+   - Return answer as TEXT describing the data
+   Example: "How many items?" → query_api("GET", "/items/")
+   Example: "What are the scores?" → query_api("GET", "/analytics/scores?lab=lab-01")
+
+5. Auth/testing questions (status codes without auth):
+   - Call query_api with use_auth=false to test unauthenticated access
+   Example: "What status without auth?" → query_api("GET", "/items/", use_auth=false)
+
+6. Bug diagnosis:
+   - Step 1: Call query_api to see the error
+   - Step 2: Call read_file to find the buggy code
+   - Step 3: Return FINAL answer with source field
+
+OUTPUT FORMAT:
+- Final answer MUST be valid JSON: {"answer": "TEXT STRING describing the answer"}
+- The answer field must be a STRING, not a list or object
+- Include "source" field for wiki/source/bug-diagnosis questions (NOT for pure data queries)
+  - Wiki questions: "source": "wiki/filename.md"
+  - Source code questions: "source": "backend/app/filename.py"
+  - Bug diagnosis: "source": "backend/app/filename.py" (where the bug is)
+- DO NOT include explanatory text outside the JSON
+- DO NOT say "Let me check" or "I will read" - only provide the FINAL answer
+
+THINKING PROCESS:
+1. Analyze the question type (wiki, source code, docker, or data query)
+2. ALWAYS call the appropriate tool FIRST
+3. If file not found, use list_files() to discover correct location
+4. Keep calling tools until you have enough information
+5. Return final JSON answer as TEXT STRING - NO intermediate thoughts"""
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -160,7 +326,7 @@ DO NOT include explanatory text. Output ONLY the JSON object."""
     ]
     
     tool_calls_history = []
-    max_iterations = 10
+    max_iterations = 20
     
     for iteration in range(max_iterations):
         data = {
@@ -199,15 +365,19 @@ DO NOT include explanatory text. Output ONLY the JSON object."""
             else:
                 answer = message["content"].strip()
                 parsed_json = extract_json_from_text(answer)
-                
+
                 final_answer = parsed_json.get("answer", answer) if parsed_json else answer
-                source = parsed_json.get("source", "unknown") if parsed_json else "unknown"
+                # Source is optional - only include if present (for wiki/source questions)
+                source = parsed_json.get("source") if parsed_json else None
                 
-                print(json.dumps({
+                output = {
                     "answer": final_answer,
-                    "source": source,
                     "tool_calls": tool_calls_history
-                }, ensure_ascii=False, indent=2))
+                }
+                if source:
+                    output["source"] = source
+                    
+                print(json.dumps(output, ensure_ascii=False, indent=2))
                 return
                 
         except Exception as e:
