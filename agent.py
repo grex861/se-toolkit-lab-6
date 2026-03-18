@@ -372,10 +372,9 @@ THINKING PROCESS:
                 
                 output = {
                     "answer": final_answer,
+                    "source": source if source else "",  # ← ВСЕГДА добавляет source (даже пустой)
                     "tool_calls": tool_calls_history
                 }
-                if source:
-                    output["source"] = source
                     
                 print(json.dumps(output, ensure_ascii=False, indent=2))
                 return
